@@ -38,7 +38,8 @@ class BacktestEngine:
                     top_n: int = 50,
                     rebalance_freq: str = '1W',
                     start_date: Optional[str] = None,
-                    end_date: Optional[str] = None) -> Dict:
+                    end_date: Optional[str] = None,
+                    signal_lag: int = 1) -> Dict:
         """
         Run backtest with factor signals
         
@@ -49,6 +50,7 @@ class BacktestEngine:
             rebalance_freq: Rebalancing frequency ('1D', '1W', '1M')
             start_date: Start date for backtest
             end_date: End date for backtest
+            signal_lag: Days between signal calculation and execution (default: 1 to avoid look-ahead bias)
             
         Returns:
             Dictionary with backtest results
@@ -63,6 +65,13 @@ class BacktestEngine:
         # Filter date range
         df = data.copy()
         df['trade_date'] = pd.to_datetime(df['trade_date'])
+        df = df.sort_values(['stock_code', 'trade_date'])
+        
+        # Filter survivorship bias: remove stocks with delisting_date before trade_date
+        if 'delisting_date' in df.columns:
+            df['delisting_date'] = pd.to_datetime(df['delisting_date'])
+            df = df[(df['delisting_date'].isna()) | (df['delisting_date'] > df['trade_date'])]
+            logger.info("Applied survivorship bias filter")
         
         if start_date:
             df = df[df['trade_date'] >= start_date]
@@ -77,40 +86,64 @@ class BacktestEngine:
         rebalance_dates = self._get_rebalance_dates(df, rebalance_freq)
         
         logger.info(f"Running backtest from {df['trade_date'].min()} to {df['trade_date'].max()}")
-        logger.info(f"Rebalancing {len(rebalance_dates)} times")
+        logger.info(f"Rebalancing {len(rebalance_dates)} times with {signal_lag}-day signal lag")
         
         # Run backtest
-        for date in tqdm(rebalance_dates, desc="Backtesting"):
-            # Get data for this date
-            date_data = df[df['trade_date'] == date].copy()
+        for i, date in enumerate(tqdm(rebalance_dates, desc="Backtesting")):
+            # CRITICAL: Use signal from T-lag to avoid look-ahead bias
+            if i < signal_lag:
+                continue  # Skip first few periods where we don't have lagged signals
             
-            if date_data.empty:
+            signal_date = rebalance_dates[i - signal_lag]
+            
+            # Get signal data from T-lag
+            signal_data = df[df['trade_date'] == signal_date].copy()
+            
+            if signal_data.empty:
                 continue
             
-            # Rank stocks by signal
-            date_data = date_data.dropna(subset=[signal_column])
-            date_data = date_data.sort_values(signal_column, ascending=False)
+            # Rank stocks by signal from T-lag
+            signal_data = signal_data.dropna(subset=[signal_column])
+            signal_data = signal_data.sort_values(signal_column, ascending=False)
             
-            # Select top N stocks
-            selected_stocks = date_data.head(top_n)
+            # Select top N stocks based on T-lag signals
+            selected_stocks = signal_data.head(top_n)
+            selected_codes = set(selected_stocks['stock_code'].values)
+            
+            # Get execution prices at current date T
+            execution_data = df[df['trade_date'] == date].copy()
+            
+            if execution_data.empty:
+                continue
+            
+            # Filter to only selected stocks that still exist at execution date
+            execution_data = execution_data[execution_data['stock_code'].isin(selected_codes)]
             
             # Equal weight portfolio
+            n_available = len(execution_data)
+            if n_available == 0:
+                continue
+                
             target_weights = {
-                row['stock_code']: 1.0 / top_n
-                for _, row in selected_stocks.iterrows()
+                row['stock_code']: 1.0 / n_available
+                for _, row in execution_data.iterrows()
             }
             
-            # Get prices
-            prices = {
+            # Get execution prices (use close price at T)
+            execution_prices = {
                 row['stock_code']: row['close']
-                for _, row in selected_stocks.iterrows()
+                for _, row in execution_data.iterrows()
             }
             
-            # Rebalance portfolio
-            self.portfolio.rebalance(target_weights, prices, str(date))
+            # Rebalance portfolio at T with T-lag signals
+            self.portfolio.rebalance(target_weights, execution_prices, str(date))
             
-            # Record state
-            self.portfolio.record_state(str(date), prices)
+            # Record state with all available prices at T
+            all_prices = {
+                row['stock_code']: row['close']
+                for _, row in df[df['trade_date'] == date].iterrows()
+            }
+            self.portfolio.record_state(str(date), all_prices)
         
         # Get results
         portfolio_df = self.portfolio.get_history_df()
@@ -163,7 +196,7 @@ class BacktestEngine:
         # Get unique dates
         dates = sorted(df['trade_date'].unique())
         
-        logger.info(f"Running custom strategy backtest")
+        logger.info("Running custom strategy backtest")
         
         for date in tqdm(dates, desc="Backtesting"):
             # Get data up to this date

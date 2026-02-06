@@ -67,6 +67,11 @@ class Portfolio:
         if shares <= 0:
             return
         
+        # Validate price
+        if price <= 0:
+            logger.warning(f"Invalid price {price} for {stock_code}, skipping buy")
+            return
+        
         # Apply slippage (buy at higher price)
         actual_price = price * (1 + self.slippage_rate)
         
@@ -85,6 +90,11 @@ class Portfolio:
             cost = shares * actual_price
             commission = cost * self.commission_rate
             total_cost = cost + commission
+            
+            # Final validation: ensure we still have enough cash
+            if total_cost > self.cash:
+                logger.warning(f"Cannot buy {stock_code}: total_cost {total_cost} > cash {self.cash}")
+                return
         
         # Execute trade
         self.cash -= total_cost
@@ -114,6 +124,11 @@ class Portfolio:
             date: Trade date
         """
         if shares <= 0:
+            return
+        
+        # Validate price
+        if price <= 0:
+            logger.warning(f"Invalid price {price} for {stock_code}, skipping sell")
             return
         
         current_position = self.positions.get(stock_code, 0)
